@@ -94,13 +94,59 @@ def get_parquet_paths(dataset_path: Path, info: dict) -> list[Path]:
     return sorted(paths)
 
 
+# Well-known state/action column names used by various embodiment converters
+# (e.g. DROID uses "joint_position" / "gripper_position" / "actions").
+_KNOWN_STATE_NAMES = {
+    "joint_position", "gripper_position",
+    "observation.state",  # prefix-matched separately below
+}
+_KNOWN_ACTION_NAMES = {
+    "action", "actions",
+}
+# Columns that are never state/action even if their dtype is numeric
+_IGNORE_COLS = {
+    "timestamp", "frame_index", "episode_index", "index", "task_index",
+}
+
+
 def detect_features(info: dict) -> dict:
-    """Return categorised feature names from info.json."""
+    """Return categorised feature names from info.json.
+
+    Supports both the standard LeRobot naming (``observation.state.*``,
+    ``action``, dtype ``video``) and alternative conventions used by
+    embodiment-specific converters (e.g. ``joint_position``,
+    ``gripper_position``, ``actions``, dtype ``image``).
+    """
     features = info.get("features", {})
-    state_keys = [k for k in features if k.startswith("observation.state")]
-    action_keys = [k for k in features if k == "action" or k.startswith("action.")]
-    video_keys = [k for k in features if features[k].get("dtype") == "video"]
-    annotation_keys = [k for k in features if k.startswith("annotation")]
+
+    state_keys: list[str] = []
+    action_keys: list[str] = []
+    video_keys: list[str] = []
+    annotation_keys: list[str] = []
+
+    for k, v in features.items():
+        dtype = v.get("dtype", "")
+
+        # --- State ---
+        if k.startswith("observation.state") or k in _KNOWN_STATE_NAMES:
+            state_keys.append(k)
+            continue
+
+        # --- Action ---
+        if k in _KNOWN_ACTION_NAMES or k.startswith("action."):
+            action_keys.append(k)
+            continue
+
+        # --- Video / Image ---
+        if dtype in ("video", "image"):
+            video_keys.append(k)
+            continue
+
+        # --- Annotation ---
+        if k.startswith("annotation"):
+            annotation_keys.append(k)
+            continue
+
     return {
         "state": state_keys,
         "action": action_keys,
@@ -137,13 +183,22 @@ def build_modality_json(
     action_mapping: dict[str, list[int]] | None,
     task_key: str | None,
 ) -> dict:
-    """Build the modality.json structure expected by GEAR/DreamZero."""
+    """Build the modality.json structure expected by GEAR/DreamZero.
+
+    When multiple state columns are detected (e.g. ``joint_position`` and
+    ``gripper_position``), each column is emitted as its own modality entry
+    with the full column range, unless the user provides an explicit
+    ``state_mapping`` (which is always applied to the *first* state column
+    only, for backward compatibility).
+    """
     features = detected["features"]
     modality: dict = {"state": {}, "action": {}, "video": {}, "annotation": {}}
 
     # --- State ---
-    state_col = detected["state"][0] if detected["state"] else None
-    if state_col and state_mapping:
+    state_cols = detected["state"]
+    if state_cols and state_mapping:
+        # User-provided explicit mapping -- applied to first state column
+        state_col = state_cols[0]
         for name, (start, end) in state_mapping.items():
             dtype = features[state_col].get("dtype", "float64")
             modality["state"][name] = {
@@ -155,19 +210,23 @@ def build_modality_json(
                 "dtype": dtype,
                 "range": None,
             }
-    elif state_col:
-        shape = features[state_col].get("shape", [1])
-        dim = shape[0] if isinstance(shape, list) else shape
-        dtype = features[state_col].get("dtype", "float64")
-        modality["state"]["state"] = {
-            "original_key": state_col,
-            "start": 0,
-            "end": dim,
-            "rotation_type": None,
-            "absolute": True,
-            "dtype": dtype,
-            "range": None,
-        }
+    elif state_cols:
+        # Auto-detect: emit one entry per state column
+        for state_col in state_cols:
+            shape = features[state_col].get("shape", [1])
+            dim = shape[0] if isinstance(shape, list) else shape
+            dtype = features[state_col].get("dtype", "float64")
+            # Use column name as the modality sub-key
+            short_name = state_col.replace("observation.state.", "").replace("observation.state", "state")
+            modality["state"][short_name] = {
+                "original_key": state_col,
+                "start": 0,
+                "end": dim,
+                "rotation_type": None,
+                "absolute": True,
+                "dtype": dtype,
+                "range": None,
+            }
 
     # --- Action ---
     action_col = detected["action"][0] if detected["action"] else None
@@ -187,7 +246,9 @@ def build_modality_json(
         shape = features[action_col].get("shape", [1])
         dim = shape[0] if isinstance(shape, list) else shape
         dtype = features[action_col].get("dtype", "float64")
-        modality["action"]["action"] = {
+        # Normalize "actions" (plural) to "action" for the modality key
+        short_name = "action" if action_col in ("action", "actions") else action_col.replace("action.", "")
+        modality["action"][short_name] = {
             "original_key": action_col,
             "start": 0,
             "end": dim,
@@ -574,9 +635,21 @@ def main():
         log.info("  Skipping relative stats (no --relative-action-keys provided)")
 
     # 7. Build tasks.jsonl
+    #    If tasks.jsonl already exists with real content (not just a single
+    #    empty task), preserve it -- it was likely written by the upstream
+    #    LeRobot converter with language annotations we cannot reconstruct.
     tasks_path = meta_dir / "tasks.jsonl"
-    if tasks_path.exists() and not args.force:
-        log.info("  tasks.jsonl already exists, skipping")
+    _existing_tasks_ok = False
+    if tasks_path.exists():
+        with open(tasks_path) as f:
+            _lines = [l.strip() for l in f if l.strip()]
+        if len(_lines) > 1 or (len(_lines) == 1 and json.loads(_lines[0]).get("task", "") != ""):
+            _existing_tasks_ok = True
+
+    if _existing_tasks_ok and not args.force:
+        log.info("  tasks.jsonl already exists with %d tasks, preserving", len(_lines))
+    elif _existing_tasks_ok:
+        log.info("  tasks.jsonl already has %d tasks, preserving (--force does not overwrite valid tasks)", len(_lines))
     else:
         tasks = build_tasks(parquet_paths, task_key)
         with open(tasks_path, "w") as f:
@@ -585,9 +658,21 @@ def main():
         log.info("  Wrote tasks.jsonl (%d tasks)", len(tasks))
 
     # 8. Build episodes.jsonl
+    #    Same preservation logic: if episodes already have task content, keep them.
     episodes_path = meta_dir / "episodes.jsonl"
-    if episodes_path.exists() and not args.force:
-        log.info("  episodes.jsonl already exists, skipping")
+    _existing_episodes_ok = False
+    if episodes_path.exists():
+        with open(episodes_path) as f:
+            _ep_lines = [l.strip() for l in f if l.strip()]
+        if _ep_lines:
+            first_ep = json.loads(_ep_lines[0])
+            if first_ep.get("tasks", [""])[0] != "":
+                _existing_episodes_ok = True
+
+    if _existing_episodes_ok and not args.force:
+        log.info("  episodes.jsonl already exists with task content, preserving")
+    elif _existing_episodes_ok:
+        log.info("  episodes.jsonl already has task content, preserving (--force does not overwrite valid episodes)")
     else:
         tasks = []
         if tasks_path.exists():
