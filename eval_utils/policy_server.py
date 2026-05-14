@@ -78,6 +78,7 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            ping_interval=None,
         ) as server:
             await server.serve_forever()
 
@@ -92,8 +93,7 @@ class WebsocketPolicyServer:
             try:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
                 
-                endpoint = obs["endpoint"]
-                del obs["endpoint"]
+                endpoint = obs.pop("endpoint", "infer")
                 if endpoint == "reset":
                     self._policy.reset(obs)
                     to_return = "reset successful"

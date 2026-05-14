@@ -302,7 +302,7 @@ class ARDroidRoboarenaPolicy:
         if self._is_first_call:
             self._is_first_call = False
         
-        return action
+        return {"actions": action}
     
     def _reset_state(self, save_video: bool = True) -> None:
         """Internal method to reset policy state.
