@@ -329,6 +329,7 @@ def main(
         variation_level: float = 1.0,
         early_stop_on_success: bool = True,
         early_stop_success_delay_s: float = 2.0,
+        seed: int = 42,
         ):
     if task_suite not in TASK_SUITES:
         raise ValueError(f"Task suite {task_suite!r} not supported. Available: {TASK_SUITES}")
@@ -394,6 +395,7 @@ def main(
         use_fabric=True,
     )
     env_cfg.set_scene(scene, variation=scene_variation)
+    env_cfg.seed = seed
     env = gym.make("DROID", cfg=env_cfg)
 
     obs, _ = env.reset()
@@ -443,6 +445,7 @@ def main(
         "headless": headless,
         "early_stop_on_success": early_stop_on_success,
         "early_stop_success_delay_s": early_stop_success_delay_s,
+        "seed": seed,
     }
     metadata_path = video_dir / "run_metadata.json"
     with open(metadata_path, "w") as f:
